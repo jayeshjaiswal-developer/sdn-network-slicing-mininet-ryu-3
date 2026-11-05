@@ -1,0 +1,28 @@
+$ ryu-manager slice_controller.py
+loading app slice_controller.py
+loading app ryu.controller.ofp_handler
+instantiating app slice_controller.py of SliceController
+instantiating app ryu.controller.ofp_handler of OFPHandler
+Switch 2 connected
+Switch 1 connected
+s1 eMBB: 10.0.0.1 -> 10.0.0.3 via queue 0
+s2 eMBB: 10.0.0.1 -> 10.0.0.3 via queue 0
+s2 eMBB: 10.0.0.3 -> 10.0.0.1 via queue 0
+s1 eMBB: 10.0.0.3 -> 10.0.0.1 via queue 0
+s2 eMBB: 10.0.0.1 -> 10.0.0.3 via queue 0
+s2 eMBB: 10.0.0.1 -> 10.0.0.3 via queue 0
+s2 eMBB: 10.0.0.1 -> 10.0.0.3 via queue 0
+s2 eMBB: 10.0.0.3 -> 10.0.0.1 via queue 0
+s2 eMBB: 10.0.0.3 -> 10.0.0.1 via queue 0
+s2 eMBB: 10.0.0.1 -> 10.0.0.3 via queue 0
+s2 eMBB: 10.0.0.1 -> 10.0.0.3 via queue 0
+s1 URLLC: 10.0.0.2 -> 10.0.0.4 via queue 1
+s2 URLLC: 10.0.0.2 -> 10.0.0.4 via queue 1
+s2 URLLC: 10.0.0.4 -> 10.0.0.2 via queue 1
+s1 URLLC: 10.0.0.4 -> 10.0.0.2 via queue 1
+s2 URLLC: 10.0.0.2 -> 10.0.0.4 via queue 1
+s1 URLLC: 10.0.0.4 -> 10.0.0.2 via queue 1
+s1 URLLC: 10.0.0.4 -> 10.0.0.2 via queue 1
+s1 URLLC: 10.0.0.4 -> 10.0.0.2 via queue 1
+s1 URLLC: 10.0.0.4 -> 10.0.0.2 via queue 1
+s1 DROP 10.0.0.1 -> 10.0.0.4 (cross-slice)
