@@ -6,27 +6,28 @@ Two-slice Mininet topology for SDN network slicing.
                 s1 ===== 10 Mbps ===== s2
     h2 (URLLC) /    shared link       \ h4 (URLLC)
 
-The shared s1<->s2 link is split with OVS HTB queues:
-    queue 0 -> eMBB  slice, max 7 Mbps
-    queue 1 -> URLLC slice, max 3 Mbps
-The Ryu controller (slice_controller.py) decides which queue each flow uses.
+The shared s1<->s2 link gets one OVS HTB queue per slice. The controller
+creates those queues when the switches connect (from config/slices.json)
+and changes them through its REST API while the network runs; this script
+only builds the network and checks that the queues appeared.
 
 Run (after starting the controller):
     sudo python3 src/slice_topo.py
 """
-import subprocess
+import json
+import os
+import time
 
 from mininet.cli import CLI
-from mininet.log import info, setLogLevel
+from mininet.log import info, setLogLevel, warn
 from mininet.net import Mininet
 from mininet.node import OVSSwitch, RemoteController
 from mininet.topo import Topo
 
-LINK_MAX = 10_000_000   # bits/s on the shared link
-SLICE_QUEUES = {
-    0: 7_000_000,       # eMBB
-    1: 3_000_000,       # URLLC
-}
+import ovs_qos
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.environ.get("SLICE_CONFIG", os.path.join(HERE, "..", "config", "slices.json"))
 
 
 class SliceTopo(Topo):
@@ -45,48 +46,46 @@ class SliceTopo(Topo):
         self.addLink(s1, s2)
 
 
-def configure_queues(port):
-    """Attach HTB queues for each slice to an OVS port."""
-    cmd = [
-        "ovs-vsctl", "--", "set", "port", port, "qos=@newqos",
-        "--", "--id=@newqos", "create", "qos", "type=linux-htb",
-        f"other-config:max-rate={LINK_MAX}",
-        "queues=" + ",".join(f"{q}=@q{q}" for q in SLICE_QUEUES),
-    ]
-    for q, rate in SLICE_QUEUES.items():
-        cmd += ["--", f"--id=@q{q}", "create", "queue",
-                f"other-config:max-rate={rate}"]
-    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)
-    info(f"*** QoS queues configured on {port}\n")
-
-
-def clear_queues():
-    subprocess.run(["ovs-vsctl", "--all", "destroy", "qos", "--",
-                    "--all", "destroy", "queue"], check=False)
+def wait_for_queues(ports, timeout=10):
+    """The controller sets the queues when the switches connect; wait for them."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        missing = [p for p in ports if not ovs_qos.has_qos(p)]
+        if not missing:
+            for p in ports:
+                info(f"*** QoS queues configured on {p}\n")
+            return
+        time.sleep(0.5)
+    warn(f"*** WARNING: no queues on {', '.join(missing)}. Slicing is NOT active.\n"
+         "*** Is the controller running, and was it started with sudo?\n")
 
 
 def main():
     setLogLevel("info")
+    with open(CONFIG_PATH) as f:
+        cfg = json.load(f)
+
     net = Mininet(
         topo=SliceTopo(),
         switch=OVSSwitch,
         controller=lambda name: RemoteController(name, ip="127.0.0.1", port=6633),
         autoSetMacs=True,
     )
+    ovs_qos.clear_all()     # leftovers from a crashed run
     net.start()
-    configure_queues("s1-eth3")
-    configure_queues("s2-eth3")
+    wait_for_queues(cfg["trunk_ports"])
 
-    info("\n*** Try these tests:\n"
+    info("\n*** Step 1 tests:\n"
          "  h3 iperf -s &\n  h4 iperf -s &\n"
          "  h1 iperf -c 10.0.0.3 -t 10   (eMBB, expect ~7 Mbps)\n"
          "  h2 iperf -c 10.0.0.4 -t 10   (URLLC, expect ~3 Mbps)\n"
-         "  h1 ping -c 3 10.0.0.4        (cross-slice, expect 100% loss)\n\n")
+         "  h1 ping -c 3 10.0.0.4        (cross-slice, expect 100% loss)\n"
+         "*** Step 2: change slices from another terminal with scripts/slicectl.py\n\n")
     try:
         CLI(net)
     finally:
         net.stop()
-        clear_queues()
+        ovs_qos.clear_all()
 
 
 if __name__ == "__main__":

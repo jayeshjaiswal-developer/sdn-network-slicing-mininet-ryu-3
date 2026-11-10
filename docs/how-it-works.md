@@ -3,6 +3,13 @@
 This guide explains what happens when you run the testbed, from the big ideas
 down to individual lines of code. No prior SDN knowledge needed.
 
+> **Updated in Step 2:** the slice table moved out of the code into
+> `config/slices.json` and `src/slice_manager.py`, and the controller (not
+> `slice_topo.py`) now creates the queues. Everything below about packets,
+> flow rules and queues still applies. Read
+> [step2-rest-api.md](step2-rest-api.md) for what changed. The code
+> walkthrough in section 5 describes the Step 1 version (tag `step-1`).
+
 ---
 
 ## 1. The big ideas

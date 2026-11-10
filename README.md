@@ -1,44 +1,52 @@
-# Network Slicing and Orchestration using Agentic AI in 5G/6G
+# SDN Network Slicing with Mininet and Ryu
 
 MTech (Computer Science) thesis project, University of Hyderabad.
 Guide: Prof. Satish Narayana Srirama.
 
-The goal is an **autonomous, zero-touch network slicing system**: an AI agent
-takes a high-level goal (an *intent*, e.g. "keep URLLC latency under 10 ms"),
-watches the network, and creates, resizes or removes network slices on its own
-to keep that goal met.
+An SDN testbed that splits one shared link into isolated network slices
+(eMBB and URLLC), each with its own bandwidth, and a **REST API to create,
+resize and delete slices while the network runs**. It is the foundation for
+the thesis goal: an AI agent that manages slices on its own (zero-touch).
 
-This repository is built step by step. **Step 1 (done)** is the foundation: a
-software-defined network (SDN) with two isolated slices, each with its own
-guaranteed bandwidth share.
+| Step | What | Status |
+|---|---|---|
+| 1 | Two isolated slices with fixed bandwidth (Mininet + Ryu + OVS queues) | Done |
+| 2 | REST API: create / resize / change hosts / delete slices at runtime | **Done** |
+| 3 | Live per-slice monitoring (throughput, latency, load) | Next |
+| 4 | 5G core with slices (Open5GS + UERANSIM) | Planned |
+| 5 | Dynamic resource allocation: LP baseline + DRL (PPO) agent | Planned |
+| 6 | Agentic AI orchestrator: LLM intents + DRL, closed loop (ZSM) | Planned |
+| 7 | Experiments and evaluation | Planned |
 
 ---
 
-## Step 1: Two-slice SDN testbed
+## How it works
 
 ```
-    h1 (eMBB)  \                          / h3 (eMBB)
-                s1 ====== 10 Mbps ====== s2
-    h2 (URLLC) /     shared link          \ h4 (URLLC)
-                         |
-                  Ryu controller
-              (decides who goes where)
+                         slicectl / curl / (later) AI agent
+                                      │  REST API :8080
+                                      ▼
+                           Ryu controller (slice table)
+                    OpenFlow rules │            │ queue rates (ovs-vsctl)
+                                   ▼            ▼
+    h1 (eMBB)  \                                            / h3 (eMBB)
+                s1 ============ 10 Mbps shared link ====== s2
+    h2 (URLLC) /                                            \ h4 (URLLC)
 ```
 
-| Slice | Hosts | Bandwidth share | Represents |
+| Slice | Hosts | Starting bandwidth | Represents |
 |---|---|---|---|
-| eMBB | h1, h3 | up to 7 Mbps | High-speed traffic (video, downloads) |
-| URLLC | h2, h4 | up to 3 Mbps | Low-latency traffic (robots, control) |
+| eMBB | h1, h3 | 7 Mbps | High-speed traffic (video, downloads) |
+| URLLC | h2, h4 | 3 Mbps | Low-latency traffic (robots, control) |
 
-What it demonstrates:
+- **Slicing:** each slice has its own queue on the shared link.
+- **Isolation:** hosts in different slices cannot reach each other.
+- **Live control:** the REST API changes slices without restarting anything,
+  and refuses changes that would give out more bandwidth than the link has.
 
-1. **Bandwidth slicing:** each slice gets its own share of one shared link.
-2. **Isolation:** hosts in different slices cannot talk to each other.
-3. **Central control:** one controller program decides all of this; the
-   switches just follow its rules.
-
-New to SDN or slicing? Read **[docs/how-it-works.md](docs/how-it-works.md)**.
-It explains every part in plain language, including a walk through the code.
+Plain-language guides:
+- [docs/how-it-works.md](docs/how-it-works.md): SDN, slicing and packet flow (Step 1)
+- [docs/step2-rest-api.md](docs/step2-rest-api.md): how live slice changes work (Step 2)
 
 ---
 
@@ -46,7 +54,7 @@ It explains every part in plain language, including a walk through the code.
 
 - Ubuntu 22.04 or newer (a VM is fine; tested on Ubuntu 26.04 ARM in QEMU on
   an Apple Silicon Mac). Mininet needs Linux, so it does not run on macOS directly.
-- About 4 GB RAM for this step.
+- About 4 GB RAM.
 
 ## Setup (once)
 
@@ -54,36 +62,63 @@ It explains every part in plain language, including a walk through the code.
 bash setup.sh
 ```
 
-This installs Mininet, Open vSwitch and iperf, and puts Ryu in its own
-Python 3.9 environment at `~/ryu-env` (Ryu does not work on newer Python).
-If the install fails, see [docs/troubleshooting.md](docs/troubleshooting.md).
+Installs Mininet, Open vSwitch and iperf, and puts Ryu in its own Python 3.9
+environment at `~/ryu-env`. Problems: [docs/troubleshooting.md](docs/troubleshooting.md).
 
 ## Run
 
-**Terminal 1: start the controller (leave it running)**
+**Terminal 1: controller** (sudo is needed so it can change switch queues)
 ```bash
-source ~/ryu-env/bin/activate
-ryu-manager src/slice_controller.py
+sudo ~/ryu-env/bin/ryu-manager src/slice_controller.py
 ```
 
-**Terminal 2: start the network**
+**Terminal 2: network**
 ```bash
 sudo python3 src/slice_topo.py
 ```
+Wait for `QoS queues configured on s1-eth3` and `s2-eth3`.
 
-**At the `mininet>` prompt: test it**
+**Terminal 3: control the slices**
+```bash
+python3 scripts/slicectl.py list                         # show slices
+python3 scripts/slicectl.py resize eMBB 5                # change bandwidth
+python3 scripts/slicectl.py resize URLLC 5
+python3 scripts/slicectl.py create mMTC 10.0.0.5 1       # new slice (fails: link full)
+python3 scripts/slicectl.py hosts URLLC 10.0.0.2         # change members
+python3 scripts/slicectl.py delete URLLC                 # remove a slice
+```
+
+**At the `mininet>` prompt: measure**
 ```
 h3 iperf -s &
 h4 iperf -s &
-h1 iperf -c 10.0.0.3 -t 10     # eMBB  -> about 7 Mbps
-h2 iperf -c 10.0.0.4 -t 10     # URLLC -> about 3 Mbps
-h1 ping -c 3 10.0.0.4          # cross-slice -> 100% packet loss
+h1 iperf -c 10.0.0.3 -t 10     # eMBB throughput
+h2 iperf -c 10.0.0.4 -t 10     # URLLC throughput
+h1 ping -c 3 10.0.0.4          # cross-slice: 100% loss
 ```
 
-Type `exit` to stop. If something is left over from a crashed run, clean up
-with `sudo mn -c`.
+Type `exit` to stop. After a crash: `sudo mn -c`.
 
-## Results (Step 1)
+## REST API
+
+| Method | Address | Body | Does |
+|---|---|---|---|
+| GET | `/slices` | | List slices + link status |
+| GET | `/slices/{name}` | | One slice |
+| POST | `/slices` | `{"name", "hosts", "bandwidth_mbps"}` | Create |
+| PUT | `/slices/{name}` | `{"bandwidth_mbps"}` and/or `{"hosts"}` | Change |
+| DELETE | `/slices/{name}` | | Delete |
+| GET | `/link` | | Capacity, allocated, free |
+
+Example: `curl -s -X PUT localhost:8080/slices/URLLC -d '{"bandwidth_mbps": 5}'`
+
+Rules: total bandwidth never exceeds the link (no over-provisioning), a host
+is in at most one slice, and a failed change is rolled back. Details in
+[docs/step2-rest-api.md](docs/step2-rest-api.md).
+
+## Results
+
+**Step 1 (VM, real network):**
 
 | Test | Expected | Measured |
 |---|---|---|
@@ -91,9 +126,18 @@ with `sudo mn -c`.
 | URLLC throughput (h2 → h4) | ~3 Mbps | 2.86 Mbps |
 | Cross-slice ping (h1 → h4) | 100% loss | 100% loss |
 
-Measured values are about 95% of the limits, which is normal TCP and queueing
-overhead. Full details and raw logs: [docs/step1-results.md](docs/step1-results.md)
-and [results/step1/](results/step1/).
+**Step 2:** every API operation, the rules and the rollback were tested
+against the real Ryu controller (switch simulated). The VM test plan, including
+resizing a slice under live traffic, is in
+[docs/step2-results.md](docs/step2-results.md).
+
+## Tests
+
+```bash
+~/ryu-env/bin/pip install pytest
+~/ryu-env/bin/python -m pytest tests
+```
+22 tests; they use a fake `ovs-vsctl`, so they run without Mininet or root.
 
 ---
 
@@ -101,29 +145,26 @@ and [results/step1/](results/step1/).
 
 ```
 .
-├── README.md                  you are here
-├── setup.sh                   one-time installer
+├── README.md
+├── setup.sh                     one-time installer
+├── config/
+│   └── slices.json              starting slices, link capacity, shared-link ports
 ├── src/
-│   ├── slice_topo.py          builds the virtual network + bandwidth queues
-│   └── slice_controller.py    Ryu app: routing, slicing and isolation logic
+│   ├── slice_topo.py            builds the virtual network
+│   ├── slice_controller.py      Ryu app: forwarding, slicing, isolation, REST API
+│   ├── slice_manager.py         slice table + rules (no networking code)
+│   └── ovs_qos.py               creates / resizes / deletes switch queues
+├── scripts/
+│   └── slicectl.py              command-line client for the REST API
+├── tests/                       unit tests + fake ovs-vsctl
 ├── docs/
-│   ├── how-it-works.md        plain-language explanation of everything
-│   ├── step1-results.md       what was tested and what it shows
-│   └── troubleshooting.md     install problems and their fixes
-└── results/step1/             raw logs from the test run
+│   ├── how-it-works.md          SDN and slicing explained (Step 1)
+│   ├── step2-rest-api.md        live slice control explained (Step 2)
+│   ├── step1-results.md
+│   ├── step2-results.md
+│   └── troubleshooting.md
+└── results/step1/               raw logs from the Step 1 run
 ```
-
-## Roadmap
-
-| Step | What | Status |
-|---|---|---|
-| 1 | SDN testbed with static slices (Mininet + Ryu) | Done |
-| 2 | REST API to create / resize / delete slices at runtime | Next |
-| 3 | Live per-slice monitoring (throughput, latency, load) | Planned |
-| 4 | 5G core with slices (Open5GS + UERANSIM) | Planned |
-| 5 | Dynamic resource allocation: LP baseline + DRL (PPO) agent | Planned |
-| 6 | Agentic AI orchestrator: LLM intents + DRL, closed loop (ZSM) | Planned |
-| 7 | Experiments and evaluation | Planned |
 
 ## References
 

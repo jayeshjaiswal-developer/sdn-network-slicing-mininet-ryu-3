@@ -57,6 +57,27 @@ sudo mn -c
 The queues weren't applied. Check for `QoS queues configured on s1-eth3` at
 startup, and inspect with `sudo ovs-vsctl list qos`.
 
+## Step 2 (REST API) problems
+
+### `WARNING: no queues on s1-eth3 ... Slicing is NOT active`
+Since Step 2 the controller creates the queues, and it needs root for that.
+Start it with sudo: `sudo ~/ryu-env/bin/ryu-manager src/slice_controller.py`.
+The controller log will show `Could not set queues: ... Permission denied`.
+
+### `Error 500: could not update switch queues ... (is the controller running with sudo?)`
+Same cause. The change was rolled back, so nothing is half-applied. Restart
+the controller with sudo.
+
+### `Cannot reach the controller at http://127.0.0.1:8080`
+The controller isn't running, or it crashed (check its terminal). If its log
+shows `Address already in use`, another program has port 8080: find it with
+`sudo ss -ltnp | grep 8080`.
+
+### A host moved to another slice but traffic still behaves the old way
+Flow rules are flushed on every membership change, so this should not
+happen. Check the controller log for `Flushed IP flow rules on 2 switch(es)`.
+If it says `0 switch(es)`, the switches aren't connected to the controller.
+
 ## Platform
 
 Mininet and Open vSwitch need the Linux kernel. On a Mac, use an Ubuntu VM
