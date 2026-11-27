@@ -82,3 +82,26 @@ If it says `0 switch(es)`, the switches aren't connected to the controller.
 
 Mininet and Open vSwitch need the Linux kernel. On a Mac, use an Ubuntu VM
 (UTM, Multipass or QEMU; ARM Ubuntu on Apple Silicon works).
+
+## Step 3 (monitoring) problems
+
+### The controller died when I ran `sudo mn -c`
+`mn -c` kills every process with "controller" in its command line, and
+that includes `slice_controller.py`. Always run `sudo mn -c` **before**
+starting the controller, never while it runs.
+
+### `slicectl top` shows `-` for throughput
+No fresh counters. Is Mininet running, and did the controller log print
+`Monitoring s1 shared-link port(s): s1-eth3 (port 3)`? If not, check that
+`trunk_ports` in `config/slices.json` matches the real port names
+(`sudo ovs-vsctl list-ports s1`).
+
+### `slicectl top` shows `-` for latency, SLA `unknown`
+The prober isn't reporting. Check that `slice_topo.py` printed
+`Latency prober running`, and that each slice has at least two hosts that
+exist in Mininet (h1–h4). A slice whose only hosts are 10.0.0.5/10.0.0.6
+has nobody to ping.
+
+### `plot_metrics.py`: `No module named 'matplotlib'`
+`sudo apt install python3-matplotlib` (or `pip3 install matplotlib`).
+

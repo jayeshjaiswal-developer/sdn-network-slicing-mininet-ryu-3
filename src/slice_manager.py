@@ -9,6 +9,7 @@ Each slice has:
     queue           OVS queue id on the shared link (assigned automatically)
     hosts           set of member host IPs
     bandwidth_mbps  max rate of the slice's queue on the shared link
+    max_latency_ms  optional latency target (SLA); monitoring flags a breach
 
 Rules enforced here:
     - slice names are unique
@@ -18,6 +19,8 @@ Rules enforced here:
 """
 import ipaddress
 import json
+
+UNSET = object()   # "argument not given", different from None ("clear it")
 
 
 class SliceError(Exception):
@@ -42,7 +45,7 @@ class SliceManager:
             cfg = json.load(f)
         mgr = cls(cfg["link_capacity_mbps"])
         for s in cfg["slices"]:
-            mgr.create(s["name"], s["hosts"], s["bandwidth_mbps"])
+            mgr.create(s["name"], s["hosts"], s["bandwidth_mbps"], s.get("max_latency_ms"))
         return mgr
 
     # ---------- queries ----------
@@ -79,24 +82,30 @@ class SliceManager:
 
     # ---------- changes ----------
 
-    def create(self, name, hosts, bandwidth_mbps):
+    def create(self, name, hosts, bandwidth_mbps, max_latency_ms=None):
         name = self._check_name(name)
         if name in self._slices:
             raise SliceError(f"slice '{name}' already exists", 409)
         hosts = self._check_hosts(hosts, owner=None)
         bw = self._check_bandwidth(bandwidth_mbps, exclude=None)
-        self._slices[name] = {"queue": self._free_queue_id(), "hosts": hosts, "bandwidth_mbps": bw}
+        sla = self._check_latency(max_latency_ms)
+        self._slices[name] = {"queue": self._free_queue_id(), "hosts": hosts,
+                              "bandwidth_mbps": bw, "max_latency_ms": sla}
         return self._describe(name)
 
-    def update(self, name, hosts=None, bandwidth_mbps=None):
-        """Change hosts and/or bandwidth. Returns (slice, hosts_changed)."""
+    def update(self, name, hosts=None, bandwidth_mbps=None, max_latency_ms=UNSET):
+        """Change hosts, bandwidth and/or latency target. Returns (slice, hosts_changed).
+
+        max_latency_ms=None removes the target; leaving it out keeps it.
+        """
         if name not in self._slices:
             raise SliceError(f"slice '{name}' does not exist", 404)
-        if hosts is None and bandwidth_mbps is None:
-            raise SliceError("nothing to change: give 'hosts' and/or 'bandwidth_mbps'")
+        if hosts is None and bandwidth_mbps is None and max_latency_ms is UNSET:
+            raise SliceError("nothing to change: give 'hosts', 'bandwidth_mbps' and/or 'max_latency_ms'")
         # Validate everything first, so a bad request changes nothing
         new_hosts = self._check_hosts(hosts, owner=name) if hosts is not None else None
         new_bw = self._check_bandwidth(bandwidth_mbps, exclude=name) if bandwidth_mbps is not None else None
+        new_sla = self._check_latency(max_latency_ms) if max_latency_ms is not UNSET else UNSET
 
         s = self._slices[name]
         hosts_changed = new_hosts is not None and new_hosts != s["hosts"]
@@ -104,6 +113,8 @@ class SliceManager:
             s["hosts"] = new_hosts
         if new_bw is not None:
             s["bandwidth_mbps"] = new_bw
+        if new_sla is not UNSET:
+            s["max_latency_ms"] = new_sla
         return self._describe(name), hosts_changed
 
     def delete(self, name):
@@ -116,12 +127,10 @@ class SliceManager:
 
     def snapshot(self):
         """A copy of the current state, to restore if applying a change fails."""
-        return {n: {"queue": s["queue"], "hosts": set(s["hosts"]),
-                    "bandwidth_mbps": s["bandwidth_mbps"]} for n, s in self._slices.items()}
+        return {n: dict(s, hosts=set(s["hosts"])) for n, s in self._slices.items()}
 
     def restore(self, snapshot):
-        self._slices = {n: {"queue": s["queue"], "hosts": set(s["hosts"]),
-                            "bandwidth_mbps": s["bandwidth_mbps"]} for n, s in snapshot.items()}
+        self._slices = {n: dict(s, hosts=set(s["hosts"])) for n, s in snapshot.items()}
 
     # ---------- validation helpers ----------
 
@@ -159,6 +168,13 @@ class SliceManager:
                 f"on the {self.link_capacity_mbps:g} Mbps link", 409)
         return float(bw)
 
+    def _check_latency(self, ms):
+        if ms is None:
+            return None
+        if isinstance(ms, bool) or not isinstance(ms, (int, float)) or ms <= 0:
+            raise SliceError("'max_latency_ms' must be a positive number or null")
+        return float(ms)
+
     def _free_queue_id(self):
         used = {s["queue"] for s in self._slices.values()}
         q = 0
@@ -169,4 +185,4 @@ class SliceManager:
     def _describe(self, name):
         s = self._slices[name]
         return {"name": name, "queue": s["queue"], "hosts": sorted(s["hosts"]),
-                "bandwidth_mbps": s["bandwidth_mbps"]}
+                "bandwidth_mbps": s["bandwidth_mbps"], "max_latency_ms": s["max_latency_ms"]}

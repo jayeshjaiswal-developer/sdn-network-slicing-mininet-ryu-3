@@ -1,8 +1,10 @@
 {
   "link_capacity_mbps": 10,
   "trunk_ports": ["s1-eth3", "s2-eth3"],
+  "poll_interval_s": 2,
+  "probe_interval_s": 2,
   "slices": [
-    {"name": "eMBB",  "hosts": ["10.0.0.1", "10.0.0.3"], "bandwidth_mbps": 7},
-    {"name": "URLLC", "hosts": ["10.0.0.2", "10.0.0.4"], "bandwidth_mbps": 3}
+    {"name": "eMBB", "hosts": ["10.0.0.1", "10.0.0.3"], "bandwidth_mbps": 7},
+    {"name": "URLLC", "hosts": ["10.0.0.2", "10.0.0.4"], "bandwidth_mbps": 3, "max_latency_ms": 10}
   ]
 }

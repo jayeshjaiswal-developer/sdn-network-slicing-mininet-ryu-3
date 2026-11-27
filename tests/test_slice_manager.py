@@ -98,3 +98,24 @@ def test_snapshot_restore(mgr):
     mgr.delete("eMBB")
     mgr.restore(snap)
     assert [s["name"] for s in mgr.list()] == ["eMBB", "URLLC"]
+
+
+def test_latency_target(mgr):
+    assert mgr.get("URLLC")["max_latency_ms"] == 10          # from config
+    assert mgr.get("eMBB")["max_latency_ms"] is None
+    mgr.update("URLLC", max_latency_ms=5)
+    assert mgr.get("URLLC")["max_latency_ms"] == 5
+    mgr.update("URLLC", bandwidth_mbps=3)                     # not given: kept
+    assert mgr.get("URLLC")["max_latency_ms"] == 5
+    mgr.update("URLLC", max_latency_ms=None)                  # null: removed
+    assert mgr.get("URLLC")["max_latency_ms"] is None
+    for bad in (0, -1, "5", True):
+        with pytest.raises(SliceError):
+            mgr.update("URLLC", max_latency_ms=bad)
+
+
+def test_snapshot_keeps_latency_target(mgr):
+    snap = mgr.snapshot()
+    mgr.update("URLLC", max_latency_ms=50)
+    mgr.restore(snap)
+    assert mgr.get("URLLC")["max_latency_ms"] == 10

@@ -1,21 +1,28 @@
 """
-Ryu controller for dynamic network slicing (Step 2).
+Ryu controller for dynamic network slicing with monitoring (Step 3).
 
 What it does:
 - Learns MAC addresses like a normal L2 switch.
 - Maps every IPv4 flow to a slice and sends it through that slice's queue.
 - Drops traffic between hosts in different slices (isolation).
-- NEW: exposes a REST API on port 8080 so slices can be listed, created,
-  resized and deleted while the network is running. The AI agent in later
-  steps will use exactly this API.
+- REST API on port 8080 to list, create, resize and delete slices while the
+  network is running (Step 2).
+- NEW: polls the switches every few seconds for each slice queue's traffic
+  counters, receives ping latency from the prober in slice_topo.py, and
+  serves live per-slice metrics (throughput, utilization, drops, latency,
+  SLA status). This is the "Monitor" part of the agent's
+  Monitor -> Analyze -> Plan -> Execute loop.
 
 REST API (all JSON):
     GET    /slices                    list slices
     GET    /slices/{name}             one slice
-    POST   /slices                    create   {"name", "hosts", "bandwidth_mbps"}
-    PUT    /slices/{name}             change   {"hosts"?, "bandwidth_mbps"?}
+    POST   /slices                    create   {"name", "hosts", "bandwidth_mbps", "max_latency_ms"?}
+    PUT    /slices/{name}             change   {"hosts"?, "bandwidth_mbps"?, "max_latency_ms"?}
     DELETE /slices/{name}             delete
     GET    /link                      capacity / allocated / free bandwidth
+    GET    /metrics                   live metrics for every slice + the link
+    GET    /metrics/{name}?seconds=N  recent history of one slice (default 60 s)
+    POST   /metrics/latency           report a ping result (used by the prober)
 
 Run (sudo is needed so the controller can change OVS queues):
     sudo ~/ryu-env/bin/ryu-manager src/slice_controller.py
@@ -23,12 +30,14 @@ Run (sudo is needed so the controller can change OVS queues):
 import json
 import os
 import sys
+import time
 
 from ryu.app.wsgi import ControllerBase, WSGIApplication, route
 from ryu.base import app_manager
 from ryu.controller import ofp_event
 from ryu.controller.handler import (CONFIG_DISPATCHER, DEAD_DISPATCHER,
                                     MAIN_DISPATCHER, set_ev_cls)
+from ryu.lib import hub
 from ryu.lib.packet import ether_types, ethernet, ipv4, packet
 from ryu.ofproto import ofproto_v1_3
 from webob import Response
@@ -36,7 +45,8 @@ from webob import Response
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import ovs_qos                                       # noqa: E402
-from slice_manager import SliceError, SliceManager   # noqa: E402
+from slice_manager import UNSET, SliceError, SliceManager   # noqa: E402
+from slice_monitor import SliceMonitor                       # noqa: E402
 
 CONFIG_PATH = os.environ.get("SLICE_CONFIG", os.path.join(HERE, "..", "config", "slices.json"))
 APP_KEY = "slice_app"
@@ -45,6 +55,7 @@ PRIO_DEFAULT = 0     # table-miss: ask the controller
 PRIO_SLICE = 10      # same slice: forward through its queue
 PRIO_DROP = 20       # different slices: drop
 FLOW_IDLE_TIMEOUT = 30
+DEFAULT_POLL_INTERVAL = 2.0   # seconds between queue-counter polls
 
 
 class SliceController(app_manager.RyuApp):
@@ -55,15 +66,19 @@ class SliceController(app_manager.RyuApp):
         super().__init__(*args, **kwargs)
         self.mac_to_port = {}   # dpid -> {mac: port}
         self.datapaths = {}     # dpid -> datapath (connected switches)
+        self.trunk_port_nos = {}   # dpid -> {port_no: port name} for shared-link ports
 
         with open(CONFIG_PATH) as f:
             cfg = json.load(f)
         self.trunk_ports = cfg["trunk_ports"]
+        self.poll_interval = float(cfg.get("poll_interval_s", DEFAULT_POLL_INTERVAL))
         self.slices = SliceManager.from_config(CONFIG_PATH)
+        self.monitor = SliceMonitor()
         self.logger.info("Loaded %d slices from %s", len(self.slices.list()), CONFIG_PATH)
 
         kwargs["wsgi"].register(SliceRestApi, {APP_KEY: self})
         self.logger.info("REST API ready on http://0.0.0.0:8080")
+        self.poller = hub.spawn(self._poll_loop)
 
     # ---------------- switch handling ----------------
 
@@ -73,6 +88,8 @@ class SliceController(app_manager.RyuApp):
         parser, ofp = dp.ofproto_parser, dp.ofproto
         actions = [parser.OFPActionOutput(ofp.OFPP_CONTROLLER, ofp.OFPCML_NO_BUFFER)]
         self.add_flow(dp, PRIO_DEFAULT, parser.OFPMatch(), actions)
+        # Ask for the port list, to learn which port number is the shared link
+        dp.send_msg(parser.OFPPortDescStatsRequest(dp, 0))
         self.logger.info("Switch %s connected", dp.id)
 
     @set_ev_cls(ofp_event.EventOFPStateChange, [MAIN_DISPATCHER, DEAD_DISPATCHER])
@@ -88,6 +105,51 @@ class SliceController(app_manager.RyuApp):
         elif ev.state == DEAD_DISPATCHER:
             self.datapaths.pop(dp.id, None)
             self.mac_to_port.pop(dp.id, None)
+            self.trunk_port_nos.pop(dp.id, None)
+
+    # ---------------- monitoring ----------------
+
+    @set_ev_cls(ofp_event.EventOFPPortDescStatsReply, MAIN_DISPATCHER)
+    def on_port_desc(self, ev):
+        """Map shared-link port names (s1-eth3) to this switch's port numbers."""
+        dp = ev.msg.datapath
+        found = {}
+        for p in ev.msg.body:
+            name = p.name.decode() if isinstance(p.name, bytes) else p.name
+            if name in self.trunk_ports:
+                found[p.port_no] = name
+        self.trunk_port_nos[dp.id] = found
+        if found:
+            self.logger.info("Monitoring s%s shared-link port(s): %s", dp.id,
+                             ", ".join(f"{n} (port {no})" for no, n in sorted(found.items())))
+
+    def _poll_loop(self):
+        """Every poll_interval, ask each switch for its shared-link queue counters."""
+        while True:
+            for dpid, dp in list(self.datapaths.items()):
+                parser, ofp = dp.ofproto_parser, dp.ofproto
+                for port_no in self.trunk_port_nos.get(dpid, {}):
+                    dp.send_msg(parser.OFPQueueStatsRequest(dp, 0, port_no, ofp.OFPQ_ALL))
+            hub.sleep(self.poll_interval)
+
+    @set_ev_cls(ofp_event.EventOFPQueueStatsReply, MAIN_DISPATCHER)
+    def on_queue_stats(self, ev):
+        dpid = ev.msg.datapath.id
+        names = self.trunk_port_nos.get(dpid, {})
+        now = time.time()
+        for st in ev.msg.body:
+            port = names.get(st.port_no)
+            if port is not None:
+                # tx_errors on an OVS HTB queue = packets the queue dropped
+                self.monitor.update_queue(port, st.queue_id, st.tx_bytes,
+                                          st.tx_packets, st.tx_errors, now)
+
+    def metrics(self):
+        now = time.time()
+        link = self.slices.link_status()
+        link["per_port"] = self.monitor.link_snapshot(self.slices.link_capacity_mbps, now)
+        return {"time": round(now, 3), "poll_interval_s": self.poll_interval,
+                "slices": self.monitor.snapshot(self.slices.list(), now), "link": link}
 
     def add_flow(self, dp, priority, match, actions, idle_timeout=0):
         parser, ofp = dp.ofproto_parser, dp.ofproto
@@ -235,8 +297,11 @@ class SliceRestApi(ControllerBase):
             if key not in b:
                 raise SliceError(f"missing '{key}'")
         created = self.app.apply_change(
-            lambda: self.app.slices.create(b["name"], b["hosts"], b["bandwidth_mbps"]),
+            lambda: self.app.slices.create(b["name"], b["hosts"], b["bandwidth_mbps"],
+                                           b.get("max_latency_ms")),
             hosts_changed=lambda _: True)
+        self.app.monitor.forget_queue(created["queue"])   # queue id may be reused
+        self.app.monitor.forget_slice(created["name"])
         self.app.logger.info("API: created slice %s", created)
         return _json(created, 201)
 
@@ -245,8 +310,9 @@ class SliceRestApi(ControllerBase):
     def update_slice(self, req, name, **kwargs):
         b = _body(req)
         updated, hosts_changed = self.app.apply_change(
-            lambda: self.app.slices.update(name, hosts=b.get("hosts"),
-                                           bandwidth_mbps=b.get("bandwidth_mbps")),
+            lambda: self.app.slices.update(
+                name, hosts=b.get("hosts"), bandwidth_mbps=b.get("bandwidth_mbps"),
+                max_latency_ms=b["max_latency_ms"] if "max_latency_ms" in b else UNSET),
             hosts_changed=lambda result: result[1])
         self.app.logger.info("API: updated slice %s", updated)
         return _json(updated)
@@ -254,8 +320,11 @@ class SliceRestApi(ControllerBase):
     @route("slices", "/slices/{name}", methods=["DELETE"])
     @_api
     def delete_slice(self, req, name, **kwargs):
+        queue = self.app.slices.get(name)["queue"]
         self.app.apply_change(lambda: self.app.slices.delete(name),
                               hosts_changed=lambda _: True)
+        self.app.monitor.forget_queue(queue)
+        self.app.monitor.forget_slice(name)
         self.app.logger.info("API: deleted slice %s", name)
         return _json({"deleted": name})
 
@@ -265,3 +334,36 @@ class SliceRestApi(ControllerBase):
     @_api
     def get_link_status(self, req, **kwargs):
         return _json(self.app.slices.link_status())
+
+    # ---------------- monitoring endpoints ----------------
+
+    @route("metrics", "/metrics", methods=["GET"])
+    @_api
+    def get_metrics(self, req, **kwargs):
+        return _json(self.app.metrics())
+
+    @route("metrics", "/metrics/{name}", methods=["GET"])
+    @_api
+    def get_slice_history(self, req, name, **kwargs):
+        s = self.app.slices.get(name)
+        try:
+            seconds = float(req.GET.get("seconds", 60))
+        except ValueError:
+            raise SliceError("'seconds' must be a number")
+        now = time.time()
+        hist = self.app.monitor.history(name, s["queue"], now - seconds)
+        return _json({"name": name, "queue": s["queue"], "seconds": seconds, **hist})
+
+    @route("metrics", "/metrics/latency", methods=["POST"])
+    @_api
+    def post_latency(self, req, **kwargs):
+        b = _body(req)
+        name = b.get("slice")
+        self.app.slices.get(name)                     # 404 if the slice is gone
+        rtt, loss = b.get("rtt_ms"), b.get("loss_pct")
+        if rtt is not None and (isinstance(rtt, bool) or not isinstance(rtt, (int, float)) or rtt < 0):
+            raise SliceError("'rtt_ms' must be a non-negative number or null")
+        if isinstance(loss, bool) or not isinstance(loss, (int, float)) or not 0 <= loss <= 100:
+            raise SliceError("'loss_pct' must be a number from 0 to 100")
+        sample = self.app.monitor.record_latency(name, rtt, loss, time.time())
+        return _json(sample, 201)

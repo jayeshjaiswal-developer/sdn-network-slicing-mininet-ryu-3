@@ -9,7 +9,8 @@ Two-slice Mininet topology for SDN network slicing.
 The shared s1<->s2 link gets one OVS HTB queue per slice. The controller
 creates those queues when the switches connect (from config/slices.json)
 and changes them through its REST API while the network runs; this script
-only builds the network and checks that the queues appeared.
+builds the network, checks that the queues appeared, and (Step 3) runs the
+latency prober that pings inside each slice and reports to the controller.
 
 Run (after starting the controller):
     sudo python3 src/slice_topo.py
@@ -25,6 +26,7 @@ from mininet.node import OVSSwitch, RemoteController
 from mininet.topo import Topo
 
 import ovs_qos
+from latency_prober import LatencyProber
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.environ.get("SLICE_CONFIG", os.path.join(HERE, "..", "config", "slices.json"))
@@ -74,16 +76,21 @@ def main():
     ovs_qos.clear_all()     # leftovers from a crashed run
     net.start()
     wait_for_queues(cfg["trunk_ports"])
+    prober = LatencyProber(net, interval=float(cfg.get("probe_interval_s", 2.0)))
+    prober.start()
+    info("*** Latency prober running (pings inside each slice every few seconds)\n")
 
     info("\n*** Step 1 tests:\n"
          "  h3 iperf -s &\n  h4 iperf -s &\n"
          "  h1 iperf -c 10.0.0.3 -t 10   (eMBB, expect ~7 Mbps)\n"
          "  h2 iperf -c 10.0.0.4 -t 10   (URLLC, expect ~3 Mbps)\n"
          "  h1 ping -c 3 10.0.0.4        (cross-slice, expect 100% loss)\n"
-         "*** Step 2: change slices from another terminal with scripts/slicectl.py\n\n")
+         "*** Step 2: change slices from another terminal with scripts/slicectl.py\n"
+         "*** Step 3: watch live metrics with: python3 scripts/slicectl.py top\n\n")
     try:
         CLI(net)
     finally:
+        prober.stop()
         net.stop()
         ovs_qos.clear_all()
 
